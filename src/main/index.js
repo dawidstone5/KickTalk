@@ -9,7 +9,9 @@ import dotenv from "dotenv";
 dotenv.config();
 
 const isDev = process.env.NODE_ENV === "development";
-const iconPath = join(__dirname, "../../resources/icons/win/KickTalk_v1.ico");
+const iconPath = process.platform === "win32" 
+  ? join(__dirname, "../../resources/icons/win/KickTalk_v1.ico")
+  : join(__dirname, "../../resources/icons/KickTalk_v1.png");
 
 const authStore = new Store({
   fileExtension: "env",
@@ -218,6 +220,12 @@ ipcMain.handle("store:set", (e, { key, value }) => {
       mainWindow.setAlwaysOnTop(value.alwaysOnTop, "screen-saver", 1);
     } else if (process.platform === "linux") {
       mainWindow.setAlwaysOnTop(value.alwaysOnTop, "screen-saver", 1);
+    }
+
+    // Handle auto-update setting changes
+    if (value.hasOwnProperty('autoUpdate') && value.autoUpdate === false) {
+      // Dismiss any active update notifications when auto-update is disabled
+      mainWindow.webContents.send("autoUpdater:dismiss");
     }
   }
 
@@ -451,7 +459,7 @@ const createWindow = () => {
 
   mainWindow.setThumbarButtons([
     {
-      icon: join(__dirname, "../../resources/icons/win/KickTalk_v1.ico"),
+      icon: iconPath,
       click: () => {
         mainWindow.show();
       },
@@ -653,7 +661,7 @@ const setupLocalShortcuts = () => {
 // initialization and is ready to create browser windows.
 // Some APIs can only be used after this event occurs.
 app.whenReady().then(() => {
-  tray = new Tray(join(__dirname, "../../resources/icons/win/KickTalk_v1.ico"));
+  tray = new Tray(iconPath);
   tray.setToolTip("KickTalk");
 
   // Set the icon for the app
