@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
+import { NavLink } from "react-router-dom";
 
 import Minus from "../assets/icons/minus-bold.svg?asset";
 import Square from "../assets/icons/square-bold.svg?asset";
@@ -49,6 +50,11 @@ const TitleBar = () => {
     <div className="titleBar">
       <div className="titleBarLeft">
         <span>KickTalk {appInfo.appVersion}</span>
+        <nav className="titleBarNav">
+          <NavLink to="/" end>Chat</NavLink>
+          <NavLink to="/browse">Browse</NavLink>
+          <NavLink to="/search">Search</NavLink>
+        </nav>
       </div>
 
       <div className={clsx("titleBarSettings", settingsModalOpen && "open")}>

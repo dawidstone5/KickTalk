@@ -1,4 +1,4 @@
-const { app, shell, BrowserWindow, ipcMain, screen, session, Tray, dialog } = require("electron");
+const { app, shell, BrowserWindow, ipcMain, screen, session, safeStorage, Tray, dialog } = require("electron");
 import { join, basename } from "path";
 import { electronApp, optimizer } from "@electron-toolkit/utils";
 import { update } from "./utils/update";
@@ -6,24 +6,174 @@ import Store from "electron-store";
 import store from "../../utils/config";
 import fs from "fs";
 import dotenv from "dotenv";
-dotenv.config();
+if (process.env.NODE_ENV === "development") {
+  dotenv.config();
+}
 
 const isDev = process.env.NODE_ENV === "development";
-const iconPath = process.platform === "win32" 
+const iconPath = process.platform === "win32"
   ? join(__dirname, "../../resources/icons/win/KickTalk_v1.ico")
   : join(__dirname, "../../resources/icons/KickTalk_v1.png");
 
-const authStore = new Store({
-  fileExtension: "env",
-  schema: {
-    SESSION_TOKEN: {
-      type: "string",
-    },
-    KICK_SESSION: {
-      type: "string",
-    },
-  },
+// --- Security: navigation + window-open allowlist ---------------------------
+// Hosts we permit a BrowserWindow to navigate to in-process (login flow only).
+const NAV_ALLOWED_HOSTS = new Set([
+  "kick.com",
+  "www.kick.com",
+  "dashboard.kick.com",
+  "accounts.google.com",
+  "appleid.apple.com",
+]);
+
+// Protocols safe to hand off to the user's default browser via shell.openExternal.
+const SAFE_EXTERNAL_PROTOCOLS = new Set(["https:", "http:", "mailto:"]);
+
+const isInternalRendererUrl = (rawUrl) => {
+  if (!rawUrl) return false;
+  if (rawUrl.startsWith("file://")) return true;
+  const devBase = process.env["ELECTRON_RENDERER_URL"];
+  if (isDev && devBase && rawUrl.startsWith(devBase)) return true;
+  return false;
+};
+
+const safeOpenExternal = (rawUrl) => {
+  if (typeof rawUrl !== "string") return;
+  let u;
+  try { u = new URL(rawUrl); } catch { return; }
+  if (!SAFE_EXTERNAL_PROTOCOLS.has(u.protocol)) return;
+  shell.openExternal(u.toString());
+};
+
+const safeWindowOpenHandler = (details) => {
+  safeOpenExternal(details.url);
+  return { action: "deny" };
+};
+
+// Apply navigation guards to a webContents. allowExternalHosts lets the login
+// dialog navigate Kick + OAuth providers in-window; everything else is opened
+// in the user's default browser instead.
+const applyNavigationGuards = (wc, { allowExternalHosts = false } = {}) => {
+  wc.on("will-navigate", (event, navUrl) => {
+    if (isInternalRendererUrl(navUrl)) return;
+    let u;
+    try { u = new URL(navUrl); } catch { event.preventDefault(); return; }
+    if (allowExternalHosts && (u.protocol === "https:" || u.protocol === "http:") && NAV_ALLOWED_HOSTS.has(u.hostname)) return;
+    event.preventDefault();
+    safeOpenExternal(navUrl);
+  });
+  wc.on("will-attach-webview", (event) => event.preventDefault());
+  wc.on("will-redirect", (event, navUrl) => {
+    if (isInternalRendererUrl(navUrl)) return;
+    let u;
+    try { u = new URL(navUrl); } catch { event.preventDefault(); return; }
+    if (allowExternalHosts && (u.protocol === "https:" || u.protocol === "http:") && NAV_ALLOWED_HOSTS.has(u.hostname)) return;
+    event.preventDefault();
+    safeOpenExternal(navUrl);
+  });
+  wc.setWindowOpenHandler(safeWindowOpenHandler);
+};
+
+// Shared webPreferences for every window that loads our renderer bundle.
+// NOTE: `sandbox: true` is intentionally NOT set yet — current preload imports
+// Node modules (electron-store, axios). Flip after slice 2 moves auth/API
+// surface into the main process.
+const rendererWebPreferences = () => ({
+  preload: join(__dirname, "../preload/index.js"),
+  nodeIntegration: false,
+  contextIsolation: true,
+  sandbox: false,
+  webSecurity: true,
+  allowRunningInsecureContent: false,
+  experimentalFeatures: false,
+  devTools: isDev,
+  backgroundThrottling: false,
 });
+
+// --- Auth token store (safeStorage-encrypted) -------------------------------
+// Tokens never touch disk in plaintext. Encrypted at rest with the OS keychain
+// (DPAPI on Windows, Keychain on macOS, libsecret on Linux). Falls back to a
+// best-effort no-op write with a console warning if encryption isn't
+// available — we explicitly don't want to silently regress to plaintext.
+const AUTH_FILE = join(app.getPath("userData"), "auth.bin");
+const AUTH_KEYS = ["SESSION_TOKEN", "KICK_SESSION"];
+let authCache = null;
+
+const readAuthFromDisk = () => {
+  try {
+    if (!fs.existsSync(AUTH_FILE)) return {};
+    if (!safeStorage.isEncryptionAvailable()) {
+      console.warn("[Auth]: safeStorage unavailable — cannot read encrypted tokens");
+      return {};
+    }
+    const blob = fs.readFileSync(AUTH_FILE);
+    const json = safeStorage.decryptString(blob);
+    const parsed = JSON.parse(json);
+    return typeof parsed === "object" && parsed ? parsed : {};
+  } catch (error) {
+    console.error("[Auth]: Failed to read auth file:", error);
+    return {};
+  }
+};
+
+const writeAuthToDisk = (data) => {
+  try {
+    if (!safeStorage.isEncryptionAvailable()) {
+      console.warn("[Auth]: safeStorage unavailable — refusing to write plaintext tokens");
+      return false;
+    }
+    const blob = safeStorage.encryptString(JSON.stringify(data));
+    fs.writeFileSync(AUTH_FILE, blob, { mode: 0o600 });
+    return true;
+  } catch (error) {
+    console.error("[Auth]: Failed to write auth file:", error);
+    return false;
+  }
+};
+
+// One-shot migration from the old plaintext electron-store .env file.
+const migrateLegacyAuthStore = () => {
+  try {
+    const legacy = new Store({ fileExtension: "env" });
+    const legacyToken = legacy.get("SESSION_TOKEN");
+    const legacySession = legacy.get("KICK_SESSION");
+    if (!legacyToken && !legacySession) return;
+    const data = readAuthFromDisk();
+    if (legacyToken) data.SESSION_TOKEN = legacyToken;
+    if (legacySession) data.KICK_SESSION = legacySession;
+    if (writeAuthToDisk(data)) {
+      legacy.clear();
+      console.log("[Auth]: Migrated legacy plaintext token store to safeStorage");
+    }
+  } catch (error) {
+    console.error("[Auth]: Legacy migration failed:", error);
+  }
+};
+
+const ensureAuthCache = () => {
+  if (authCache) return authCache;
+  authCache = readAuthFromDisk();
+  return authCache;
+};
+
+const getAuthTokens = () => {
+  const data = ensureAuthCache();
+  return {
+    token: data.SESSION_TOKEN || null,
+    session: data.KICK_SESSION || null,
+  };
+};
+
+const isAuthed = () => {
+  const { token, session } = getAuthTokens();
+  return Boolean(token && session);
+};
+
+const broadcastAuthChange = () => {
+  const authed = isAuthed();
+  for (const w of BrowserWindow.getAllWindows()) {
+    w.webContents.send("auth:changed", { authed });
+  }
+};
 
 ipcMain.setMaxListeners(100);
 
@@ -38,36 +188,39 @@ const logLimits = {
 
 let tray = null;
 
-const storeToken = async (token_name, token) => {
-  if (!token || !token_name) return;
-
-  try {
-    authStore.set(token_name, token);
-  } catch (error) {
-    console.error("[Auth Token]: Error storing token:", error);
+const storeToken = (token_name, token) => {
+  if (!token || !token_name || !AUTH_KEYS.includes(token_name)) return;
+  const data = ensureAuthCache();
+  data[token_name] = token;
+  if (writeAuthToDisk(data)) {
+    authCache = data;
+    broadcastAuthChange();
   }
 };
 
-const retrieveToken = async (token_name) => {
-  try {
-    const token = await authStore.get(token_name);
-    return token || null;
-  } catch (error) {
-    console.error("[Auth Token]: Error retrieving token:", error);
-    return null;
-  }
+const retrieveToken = (token_name) => {
+  if (!AUTH_KEYS.includes(token_name)) return null;
+  const data = ensureAuthCache();
+  return data[token_name] || null;
 };
 
 const clearAuthTokens = async () => {
   try {
-    authStore.clear();
+    authCache = {};
+    if (fs.existsSync(AUTH_FILE)) fs.unlinkSync(AUTH_FILE);
     await session.defaultSession.clearStorageData({
       storages: ["cookies"],
     });
+    broadcastAuthChange();
   } catch (error) {
     console.error("[Auth Token]: Error clearing tokens & cookies:", error);
   }
 };
+
+// IPC: preload-only consumers. Tokens are intentionally not exposed across the
+// contextBridge — only the boolean isAuthed reaches the renderer.
+ipcMain.handle("auth:get", () => getAuthTokens());
+ipcMain.handle("auth:isAuthed", () => isAuthed());
 
 let dialogInfo = null;
 let replyThreadInfo = null;
@@ -241,7 +394,7 @@ ipcMain.handle("store:delete", (e, { key }) => {
 
 const addUserLog = (chatroomId, userId, message, isDeleted = false) => {
   if (!chatroomId || !userId || !message) {
-    console.error("[Chat Logs]: Invalid data received:", data);
+    console.error("[Chat Logs]: Invalid data received:", { chatroomId, userId, hasMessage: !!message });
     return null;
   }
 
@@ -280,7 +433,7 @@ const addUserLog = (chatroomId, userId, message, isDeleted = false) => {
 
 const addReplyLog = (chatroomId, message, isDeleted = false) => {
   if (!message || !chatroomId || !message.metadata?.original_message?.id) {
-    console.error("[Reply Logs]: Invalid data received:", data);
+    console.error("[Reply Logs]: Invalid data received:", { chatroomId, hasMessage: !!message });
     return null;
   }
 
@@ -447,15 +600,10 @@ const createWindow = () => {
     titleBarStyle: "hidden",
     roundedCorners: true,
     icon: iconPath,
-    webPreferences: {
-      devTools: true,
-      nodeIntegration: false,
-      contextIsolation: true,
-      preload: join(__dirname, "../preload/index.js"),
-      sandbox: false,
-      backgroundThrottling: false,
-    },
+    webPreferences: rendererWebPreferences(),
   });
+
+  applyNavigationGuards(mainWindow.webContents);
 
   mainWindow.setThumbarButtons([
     {
@@ -485,11 +633,6 @@ const createWindow = () => {
     store.set("lastMainWindowState", { ...mainWindow.getNormalBounds() });
   });
 
-  mainWindow.webContents.setWindowOpenHandler((details) => {
-    shell.openExternal(details.url);
-    return { action: "deny" };
-  });
-
   mainWindow.webContents.setZoomFactor(store.get("zoomFactor"));
 
   // HMR for renderer base on electron-vite cli.
@@ -502,12 +645,7 @@ const createWindow = () => {
 };
 
 const loginToKick = async (method) => {
-  const authSession = {
-    token: await retrieveToken("SESSION_TOKEN"),
-    session: await retrieveToken("KICK_SESSION"),
-  };
-
-  if (authSession.token && authSession.session) return true;
+  if (isAuthed()) return true;
 
   const mainWindowPos = mainWindow.getPosition();
   const mainWindowSize = mainWindow.getSize();
@@ -532,9 +670,14 @@ const loginToKick = async (method) => {
         autoplayPolicy: "user-gesture-required",
         nodeIntegration: false,
         contextIsolation: true,
-        sandbox: false,
+        sandbox: true,
+        webSecurity: true,
+        allowRunningInsecureContent: false,
+        devTools: isDev,
       },
     });
+
+    applyNavigationGuards(loginDialog.webContents, { allowExternalHosts: true });
 
     switch (method) {
       case "kick":
@@ -575,8 +718,8 @@ const loginToKick = async (method) => {
         const sessionToken = decodeURIComponent(sessionCookie.value);
         const kickSessionValue = decodeURIComponent(kickSession.value);
 
-        await storeToken("SESSION_TOKEN", sessionToken);
-        await storeToken("KICK_SESSION", kickSessionValue);
+        storeToken("SESSION_TOKEN", sessionToken);
+        storeToken("KICK_SESSION", kickSessionValue);
 
         loginDialog.close();
         authDialog.close();
@@ -657,10 +800,39 @@ const setupLocalShortcuts = () => {
   });
 };
 
+// Single-instance lock — prevents racing on the auth/config stores when the
+// user double-launches the app.
+const gotInstanceLock = app.requestSingleInstanceLock();
+if (!gotInstanceLock) {
+  app.quit();
+} else {
+  app.on("second-instance", () => {
+    if (!mainWindow) return;
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
+  });
+}
+
+// Permissions decision for any web content that asks (notifications, media,
+// clipboard, geolocation, etc.). Default-deny everything we don't actively
+// need; the chat client only legitimately wants notifications + clipboard.
+const ALLOWED_PERMISSIONS = new Set(["notifications", "clipboard-sanitized-write", "clipboard-read"]);
+const installSessionPolicy = () => {
+  session.defaultSession.setPermissionRequestHandler((_wc, permission, callback) => {
+    callback(ALLOWED_PERMISSIONS.has(permission));
+  });
+  session.defaultSession.setPermissionCheckHandler((_wc, permission) => ALLOWED_PERMISSIONS.has(permission));
+};
+
 // This method will be called when Electron has finished
 // initialization and is ready to create browser windows.
 // Some APIs can only be used after this event occurs.
 app.whenReady().then(() => {
+  installSessionPolicy();
+  migrateLegacyAuthStore();
+  ensureAuthCache();
+
   tray = new Tray(iconPath);
   tray.setToolTip("KickTalk");
 
@@ -677,6 +849,11 @@ app.whenReady().then(() => {
   // see https://github.com/alex8088/electron-toolkit/tree/master/packages/utils
   app.on("browser-window-created", (_, window) => {
     optimizer.watchWindowShortcuts(window);
+  });
+
+  // Belt-and-suspenders: catch any webContents we forgot to guard explicitly.
+  app.on("web-contents-created", (_event, contents) => {
+    contents.setWindowOpenHandler(safeWindowOpenHandler);
   });
 
   // IPC test
@@ -746,14 +923,10 @@ ipcMain.handle("userDialog:open", (e, { data }) => {
     transparent: true,
     parent: mainWindow,
     backgroundColor: "#020a05",
-    webPreferences: {
-      devtools: true,
-      nodeIntegration: false,
-      contextIsolation: true,
-      preload: join(__dirname, "../preload/index.js"),
-      sandbox: false,
-    },
+    webPreferences: rendererWebPreferences(),
   });
+
+  applyNavigationGuards(userDialog.webContents);
 
   // Load the same URL as main window but with dialog hash
   if (isDev && process.env["ELECTRON_RENDERER_URL"]) {
@@ -770,10 +943,6 @@ ipcMain.handle("userDialog:open", (e, { data }) => {
     userDialog.focus();
 
     userDialog.webContents.send("userDialog:data", { ...data, pinned: false });
-    userDialog.webContents.setWindowOpenHandler((details) => {
-      shell.openExternal(details.url);
-      return { action: "deny" };
-    });
   });
 
   userDialog.on("blur", () => {
@@ -830,14 +999,10 @@ ipcMain.handle("authDialog:open", (e) => {
     roundedCorners: true,
     parent: mainWindow,
     icon: iconPath,
-    webPreferences: {
-      devtools: true,
-      nodeIntegration: false,
-      contextIsolation: true,
-      preload: join(__dirname, "../preload/index.js"),
-      sandbox: false,
-    },
+    webPreferences: rendererWebPreferences(),
   });
+
+  applyNavigationGuards(authDialog.webContents);
 
   // Load the same URL as main window but with dialog hash
   if (isDev && process.env["ELECTRON_RENDERER_URL"]) {
@@ -951,14 +1116,10 @@ ipcMain.handle("chattersDialog:open", (e, { data }) => {
     roundedCorners: true,
     parent: mainWindow,
     icon: iconPath,
-    webPreferences: {
-      devtools: true,
-      nodeIntegration: false,
-      contextIsolation: true,
-      preload: join(__dirname, "../preload/index.js"),
-      sandbox: false,
-    },
+    webPreferences: rendererWebPreferences(),
   });
+
+  applyNavigationGuards(chattersDialog.webContents);
 
   if (isDev && process.env["ELECTRON_RENDERER_URL"]) {
     chattersDialog.loadURL(`${process.env["ELECTRON_RENDERER_URL"]}/chatters.html`);
@@ -1019,14 +1180,10 @@ ipcMain.handle("searchDialog:open", (e, { data }) => {
     roundedCorners: true,
     parent: mainWindow,
     icon: iconPath,
-    webPreferences: {
-      devtools: true,
-      nodeIntegration: false,
-      contextIsolation: true,
-      preload: join(__dirname, "../preload/index.js"),
-      sandbox: false,
-    },
+    webPreferences: rendererWebPreferences(),
   });
+
+  applyNavigationGuards(searchDialog.webContents);
 
   if (isDev && process.env["ELECTRON_RENDERER_URL"]) {
     searchDialog.loadURL(`${process.env["ELECTRON_RENDERER_URL"]}/search.html`);
@@ -1042,10 +1199,6 @@ ipcMain.handle("searchDialog:open", (e, { data }) => {
 
     if (data) {
       searchDialog.webContents.send("searchDialog:data", data);
-      searchDialog.webContents.setWindowOpenHandler((details) => {
-        shell.openExternal(details.url);
-        return { action: "deny" };
-      });
     }
   });
 
@@ -1097,14 +1250,10 @@ ipcMain.handle("settingsDialog:open", async (e, { data }) => {
     roundedCorners: true,
     parent: mainWindow,
     icon: iconPath,
-    webPreferences: {
-      devtools: true,
-      nodeIntegration: false,
-      contextIsolation: true,
-      preload: join(__dirname, "../preload/index.js"),
-      sandbox: false,
-    },
+    webPreferences: rendererWebPreferences(),
   });
+
+  applyNavigationGuards(settingsDialog.webContents);
 
   if (isDev && process.env["ELECTRON_RENDERER_URL"]) {
     settingsDialog.loadURL(`${process.env["ELECTRON_RENDERER_URL"]}/settings.html`);
@@ -1120,11 +1269,6 @@ ipcMain.handle("settingsDialog:open", async (e, { data }) => {
     if (isDev) {
       settingsDialog.webContents.openDevTools();
     }
-
-    settingsDialog.webContents.setWindowOpenHandler((details) => {
-      shell.openExternal(details.url);
-      return { action: "deny" };
-    });
   });
 
   settingsDialog.on("closed", () => {
@@ -1175,14 +1319,10 @@ ipcMain.handle("replyThreadDialog:open", (e, { data }) => {
     frame: false,
     transparent: true,
     parent: mainWindow,
-    webPreferences: {
-      devtools: true,
-      nodeIntegration: false,
-      contextIsolation: true,
-      preload: join(__dirname, "../preload/index.js"),
-      sandbox: false,
-    },
+    webPreferences: rendererWebPreferences(),
   });
+
+  applyNavigationGuards(replyThreadDialog.webContents);
 
   if (isDev && process.env["ELECTRON_RENDERER_URL"]) {
     replyThreadDialog.loadURL(`${process.env["ELECTRON_RENDERER_URL"]}/replyThread.html`);

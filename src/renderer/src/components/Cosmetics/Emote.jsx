@@ -1,8 +1,15 @@
 import { memo, useCallback, useState, useMemo } from "react";
 import EmoteTooltip from "./EmoteTooltip";
 
+// 7TV ids are 24-char ULIDs; Kick ids are numeric. Bound the character set to
+// strictly what those CDNs will accept so a malformed upstream response can't
+// be used to coerce the <img> into hitting some other path on the same host.
+const SAFE_EMOTE_ID = /^[A-Za-z0-9]{1,40}$/;
+
 const Emote = memo(({ emote, overlaidEmotes = [], scale = 1, type }) => {
   const { id, name, width, height } = emote;
+
+  if (!SAFE_EMOTE_ID.test(String(id))) return null;
 
   const [showEmoteInfo, setShowEmoteInfo] = useState(false);
   const [mousePos, setMousePos] = useState({ x: null, y: null });
@@ -74,7 +81,7 @@ const Emote = memo(({ emote, overlaidEmotes = [], scale = 1, type }) => {
         </div>
 
         {/* Overlaid zero-width emotes */}
-        {overlaidEmotes.map((overlaidEmote) => (
+        {overlaidEmotes.filter((o) => SAFE_EMOTE_ID.test(String(o.id))).map((overlaidEmote) => (
           <div key={overlaidEmote.id} className="chatroomEmote zeroWidthEmote">
             <img
               className={`${type === "stv" ? "stvEmote" : "kickEmote"} emote`}

@@ -97,8 +97,7 @@ const useChatStore = create((set, get) => ({
       return;
     }
 
-    const authTokens = window.app.auth.getToken();
-    if (!authTokens?.token || !authTokens?.session) {
+    if (!window.app.auth.isAuthedSync()) {
       console.log("[7tv Presence]: No auth tokens available, skipping presence update");
       return;
     }
@@ -265,8 +264,7 @@ const useChatStore = create((set, get) => ({
       console.log("7TV WebSocket connected for chatroom:", chatroom.id);
 
       setTimeout(() => {
-        const authTokens = window.app.auth.getToken();
-        if (storeStvId && authTokens?.token && authTokens?.session) {
+        if (storeStvId && window.app.auth.isAuthedSync()) {
           sendUserPresence(storeStvId, chatroom.streamerData.user_id);
           stvPresenceUpdates.set(chatroom.streamerData.user_id, Date.now());
         } else {
@@ -2082,9 +2080,7 @@ if (window.location.pathname === "/" || window.location.pathname.endsWith("index
       console.log("[7tv Presence]: No 7TV ID found, skipping presence update checks");
       setTimeout(() => {
         storeStvId = localStorage.getItem("stvId");
-        const authTokens = window.app.auth.getToken();
-
-        if (storeStvId && authTokens?.token && authTokens?.session) {
+        if (storeStvId && window.app.auth.isAuthedSync()) {
           initializePresenceUpdates();
         } else {
           console.log("[7tv Presence]: No STV ID or auth tokens found after delay");
@@ -2095,8 +2091,7 @@ if (window.location.pathname === "/" || window.location.pathname.endsWith("index
     }
 
     // Check for auth tokens before starting presence updates
-    const authTokens = window.app.auth.getToken();
-    if (!authTokens?.token || !authTokens?.session) {
+    if (!window.app.auth.isAuthedSync()) {
       console.log("[7tv Presence]: No auth tokens available, skipping presence update initialization");
       return;
     }

@@ -1,5 +1,6 @@
-// export const urlRegex = /(https:\/\/[www.]?[-a-zA-Z0-9@:%._+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b[-a-zA-Z0-9()@:%_+.~#?&/=]*)/gi;
-export const urlRegex = /(https?:\/\/[^\s]+)/g;
+// Length-bounded to keep matchAll() linear on adversarial chat input.
+// Excluded chars (`<>"`) prevent the regex from swallowing into adjacent HTML.
+export const urlRegex = /(https?:\/\/[^\s<>"]{1,2048})/g;
 export const kickEmoteRegex = /\[emote:(?<id>\d+)[:]?(?<name>[a-zA-Z0-9-_!]*)[:]?\]/g;
 export const kickEmoteInputRegex = /(?:^|\s)(:(?<emoteCase1>\w{3,}):)|(?:^|\s)(?<emoteCase2>\w{2,})\b/g;
 export const mentionRegex = /(?:^|\s)(@(?<username>[a-zA-Z0-9_]{3,})[,.]?)(?=\s|$)/g;

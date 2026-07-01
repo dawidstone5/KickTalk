@@ -56,12 +56,19 @@ const rules = [
     regexPattern: urlRegex,
     component: ({ match, index }) => {
       const url = match[0];
-      const { isIcann, domain } = parse(url);
+      // Defence-in-depth: even though urlRegex only matches https?://, parse the
+      // URL and re-check the protocol before handing it to <a href>. Anything
+      // that doesn't round-trip through the WHATWG URL parser is rendered as
+      // plain text.
+      let parsedProtocol = null;
+      try { parsedProtocol = new URL(url).protocol; } catch { return url; }
+      if (parsedProtocol !== "https:" && parsedProtocol !== "http:") return url;
 
+      const { isIcann, domain } = parse(url);
       if (!isIcann || !domain) return url;
 
       return (
-        <a style={{ color: "#c3d6c9" }} key={`link-${index}`} href={url} target="_blank" rel="noreferrer">
+        <a style={{ color: "#c3d6c9" }} key={`link-${index}`} href={url} target="_blank" rel="noopener noreferrer">
           {url}
         </a>
       );

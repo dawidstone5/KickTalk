@@ -362,3 +362,22 @@
   border-radius: 4px;
   transition: 0.2s ease-in-out opacity;
 }
+
+.titleBarNav {
+  display: inline-flex;
+  gap: 2px;
+  margin-left: 12px;
+  -webkit-app-region: no-drag;
+
+  a {
+    color: rgba(255, 255, 255, 0.6);
+    text-decoration: none;
+    font-size: 12px;
+    font-weight: 600;
+    padding: 4px 10px;
+    border-radius: 4px;
+
+    &:hover { color: #fff; background: rgba(255, 255, 255, 0.06); }
+    &.active { color: #53fc18; background: rgba(83, 252, 24, 0.1); }
+  }
+}

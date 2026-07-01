@@ -16,6 +16,10 @@ import {
   getSubmitPollVote,
   getChatroomViewers,
 
+  // Browse / discovery
+  getLiveStreams,
+  searchKick,
+
   // Mod Actions
   getBanUser,
   getUnbanUser,
@@ -37,11 +41,32 @@ import {
 } from "../../utils/services/kick/kickAPI";
 import { getUserStvProfile, getChannelEmotes } from "../../utils/services/seventv/stvAPI";
 
-import Store from "electron-store";
-
-const authStore = new Store({
-  fileExtension: "env",
+// Tokens live in main (safeStorage-encrypted) and are fetched lazily via IPC.
+// We cache the resolved promise here so concurrent withAuth() calls share one
+// IPC roundtrip; null cache forces a refresh after login/logout broadcasts.
+let tokenPromise = null;
+let authedSync = false;
+const refreshTokens = () => {
+  tokenPromise = ipcRenderer.invoke("auth:get").then((t) => {
+    if (!t || !t.token || !t.session) {
+      authedSync = false;
+      return null;
+    }
+    authedSync = true;
+    return t;
+  });
+  return tokenPromise;
+};
+const getTokens = () => {
+  if (!tokenPromise) refreshTokens();
+  return tokenPromise;
+};
+ipcRenderer.on("auth:changed", (_e, data) => {
+  tokenPromise = null;
+  authedSync = !!data?.authed;
 });
+// Prime the sync flag so renderers get a usable value without awaiting.
+ipcRenderer.invoke("auth:isAuthed").then((v) => { authedSync = !!v; });
 
 // Get Silenced users and save the in local storage
 const saveSilencedUsers = async (sessionCookie, kickSession) => {
@@ -61,33 +86,23 @@ const saveSilencedUsers = async (sessionCookie, kickSession) => {
     console.error("[Silenced Users]: Error fetching silenced users:", error);
   }
 };
-const retrieveToken = (token_name) => {
-  return authStore.get(token_name);
-};
-
-const authSession = {
-  token: retrieveToken("SESSION_TOKEN"),
-  session: retrieveToken("KICK_SESSION"),
-};
 
 // Validate Session Token by Fetching User Data
 const validateSessionToken = async () => {
-  if (!authSession.token || !authSession.session) {
+  const tokens = await getTokens();
+  if (!tokens) {
     console.log("[Session Validation]: No session tokens available");
-    authStore.clear();
     localStorage.clear();
     return false;
   }
 
   try {
     // Get Kick ID and Username
-    const { data } = await getSelfInfo(authSession.token, authSession.session);
+    const { data } = await getSelfInfo(tokens.token, tokens.session);
 
     if (!data?.id) {
       console.warn("[Session Validation]: No user data received");
-      authStore.clear();
       localStorage.clear();
-
       return false;
     }
 
@@ -132,27 +147,19 @@ const tokenManager = {
     return await validateSessionToken();
   },
 
-  getToken() {
-    return {
-      token: authStore.get("SESSION_TOKEN"),
-      session: authStore.get("KICK_SESSION"),
-    };
-  },
-
-  clearTokens() {
-    authStore.delete("SESSION_TOKEN");
-    authStore.delete("KICK_SESSION");
+  async isAuthed() {
+    return await ipcRenderer.invoke("auth:isAuthed");
   },
 };
 
 // Check Auth for API calls that require it
 const withAuth = async (func) => {
-  if (!authSession.token || !authSession.session) {
+  const tokens = await getTokens();
+  if (!tokens) {
     console.warn("Unauthorized: No token or session found");
     return null;
   }
-
-  return func(authSession.token, authSession.session);
+  return func(tokens.token, tokens.session);
 };
 
 // Initialize with error handling
@@ -164,7 +171,8 @@ const initializePreload = async () => {
     const isValidSession = await validateSessionToken();
 
     if (isValidSession) {
-      await saveSilencedUsers(authSession.token, authSession.session);
+      const tokens = await getTokens();
+      if (tokens) await saveSilencedUsers(tokens.token, tokens.session);
     } else {
       console.log("[Preload]: Session invalid, skipping user-specific data");
     }
@@ -357,6 +365,8 @@ if (process.contextIsolated) {
         getKickAuthForEvents: (eventName, socketId) =>
           withAuth((token, session) => getKickAuthForEvents(eventName, socketId, token, session)),
         getChatroomViewers: (chatroomId) => getChatroomViewers(chatroomId),
+        getLiveStreams: (opts) => getLiveStreams(opts),
+        search: (query) => searchKick(query),
       },
 
       // kickChannelActions: {
@@ -376,7 +386,13 @@ if (process.contextIsolated) {
 
       // Utility functions
       utils: {
-        openExternal: (url) => shell.openExternal(url),
+        openExternal: (url) => {
+          if (typeof url !== "string") return;
+          let u;
+          try { u = new URL(url); } catch { return; }
+          if (!["https:", "http:", "mailto:"].includes(u.protocol)) return;
+          shell.openExternal(u.toString());
+        },
       },
 
       store: {
@@ -390,11 +406,19 @@ if (process.contextIsolated) {
         },
       },
 
-      // Authentication utilities
+      // Authentication utilities. Tokens themselves are intentionally not
+      // exposed to the renderer — only the boolean isAuthed crosses the bridge.
       auth: {
         isValidToken: () => tokenManager.isValidToken(),
-        clearTokens: () => tokenManager.clearTokens(),
-        getToken: () => tokenManager.getToken(),
+        isAuthed: () => tokenManager.isAuthed(),
+        // Synchronous best-effort flag, kept fresh by the auth:changed event.
+        // Use this for hot paths (presence updates) where awaiting is awkward.
+        isAuthedSync: () => authedSync,
+        onChanged: (callback) => {
+          const handler = (_, data) => callback(data);
+          ipcRenderer.on("auth:changed", handler);
+          return () => ipcRenderer.removeListener("auth:changed", handler);
+        },
       },
     });
   } catch (error) {

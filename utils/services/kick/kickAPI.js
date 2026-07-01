@@ -932,6 +932,47 @@ const getChatroomViewers = async (chatroomId) => {
   }
 };
 
+// Browse / discovery -----------------------------------------------------
+// These hit the same unauthenticated endpoints kick.com itself uses on the
+// homepage and search bar. If Kick changes the response shape these funcs
+// will need updating — they are intentionally thin pass-throughs so we can
+// iterate quickly without touching call sites.
+const getLiveStreams = async ({ page = 1, limit = 24, lang = "en" } = {}) => {
+  try {
+    const response = await axios.get(`${APIUrl}/stream/livestreams/${lang}`, {
+      params: { page, limit, sort: "desc" },
+      headers: { Accept: "application/json" },
+    });
+    return response.data;
+  } catch (error) {
+    console.error("[KickAPI]: Failed to fetch live streams:", error);
+    return [];
+  }
+};
+
+const searchKick = async (query) => {
+  if (!query || typeof query !== "string") return { channels: [], categories: [] };
+  try {
+    const response = await axios.get(`${APIUrl}/api/search`, {
+      params: { searched_word: query },
+      headers: { Accept: "application/json" },
+    });
+    const data = response.data || {};
+    return {
+      channels: Array.isArray(data.channels) ? data.channels : [],
+      categories: Array.isArray(data.categories) ? data.categories : [],
+    };
+  } catch (error) {
+    // Fallback: try treating the query as a direct channel slug.
+    try {
+      const direct = await getChannelInfo(query);
+      if (direct?.id) return { channels: [direct], categories: [] };
+    } catch {}
+    console.error("[KickAPI]: Search failed:", error);
+    return { channels: [], categories: [] };
+  }
+};
+
 export {
   getSelfInfo,
   getKickTalkBadges,
@@ -939,6 +980,10 @@ export {
   getUserKickId,
   getLinkThumbnail,
   getKickEmotes,
+
+  // Browse / discovery
+  getLiveStreams,
+  searchKick,
 
   // Chatroom Actions
   sendMessageToChannel,
