@@ -1,0 +1,341 @@
+============================================================
+HOW TO SPLIT THE WORKING-TREE CHANGES INTO 4 PRs
+============================================================
+
+Current working tree contains four logical changes mixed together:
+
+  PR1  Electron hardening
+  PR2  Tokens -> safeStorage
+  PR3  CSP + chat sanitize
+  PR4  Phase A: Browse / Search / Watch pages + iframe player
+
+This file describes how to land each change as its own PR off `main`.
+Delete this file (or add it to .gitignore) once you are done.
+
+------------------------------------------------------------
+0. Snapshot the current state so nothing is lost
+------------------------------------------------------------
+
+Take a one-shot WIP commit on a throwaway branch. Every PR below will
+cherry-pick files / hunks out of this snapshot.
+
+    git checkout -b wip/all-changes
+    git add -A
+    git commit -m "WIP: all hardening + stream pages"
+    # push it as a backup if you want:
+    # git push -u origin wip/all-changes
+
+From here on, `wip/all-changes` is your reference tree. Always branch
+each PR off `main`.
+
+------------------------------------------------------------
+1. PR1  -  Electron hardening
+------------------------------------------------------------
+
+Files touched in this PR (full file content from the snapshot):
+
+    electron-builder.yml
+
+Files touched in this PR (only PARTIAL changes - hunk select):
+
+    src/main/index.js     <-- only the hardening hunks, NOT the
+                              safeStorage auth code (that is PR2)
+
+Hunks to KEEP for PR1 in src/main/index.js:
+  * Add the constants block: NAV_ALLOWED_HOSTS, SAFE_EXTERNAL_PROTOCOLS,
+    isInternalRendererUrl, safeOpenExternal, safeWindowOpenHandler,
+    applyNavigationGuards, rendererWebPreferences.
+  * Replace each window's webPreferences and add applyNavigationGuards
+    (mainWindow, loginDialog, userDialog, authDialog, chattersDialog,
+    searchDialog, settingsDialog, replyThreadDialog).
+  * loginDialog: switch sandbox:false -> sandbox:true.
+  * Add gotInstanceLock + second-instance focus.
+  * Add ALLOWED_PERMISSIONS + installSessionPolicy + call it at the
+    top of app.whenReady(...).then(...).
+  * Add the global app.on("web-contents-created", ...) fallback handler.
+  * Fix the two "console.error('...', data)" calls that referenced
+    an undefined `data` (in addUserLog and addReplyLog).
+
+Hunks to SKIP (those belong to PR2):
+  * AUTH_FILE / AUTH_KEYS / authCache / readAuthFromDisk / writeAuthToDisk
+  * migrateLegacyAuthStore / ensureAuthCache / getAuthTokens / isAuthed
+  * broadcastAuthChange
+  * The rewrite of storeToken / retrieveToken / clearAuthTokens
+  * ipcMain.handle("auth:get") and ("auth:isAuthed")
+  * Wrapping dotenv.config() in `if (process.env.NODE_ENV === "development")`
+  * Adding `safeStorage` to the require destructure
+  * Removing `await retrieveToken("...")` in loginToKick
+  * The migrateLegacyAuthStore() / ensureAuthCache() calls inside whenReady
+
+Workflow:
+
+    git checkout main
+    git pull --ff-only
+    git checkout -b pr1-electron-hardening
+
+    # bring electron-builder.yml across whole-file:
+    git checkout wip/all-changes -- electron-builder.yml
+
+    # bring src/main/index.js HUNK BY HUNK:
+    git checkout -p wip/all-changes -- src/main/index.js
+    # Answer y / n on each hunk per the lists above.
+    # If a hunk mixes both PRs' code, edit it: choose 'e' to manually
+    # split.
+
+    # sanity check: run the app, make sure log-in still works.
+    pnpm install
+    pnpm dev
+
+    git add -A
+    git commit -m "harden electron: nav guards, sandbox, perms, asar"
+    git push -u origin pr1-electron-hardening
+    gh pr create --base main \
+       --title "Electron hardening: nav guards, perms, asar" \
+       --body  "See PR_SPLIT.txt PR1 for scope."
+
+------------------------------------------------------------
+2. PR2  -  Tokens -> safeStorage
+------------------------------------------------------------
+
+Depends on: PR1 merged (or rebase later).
+
+Files touched:
+
+    src/main/index.js                  (hunks - the auth-related ones
+                                        you skipped in PR1)
+    src/preload/index.js               (hunks - see below)
+    src/renderer/src/providers/ChatProvider.jsx   (full file from snapshot)
+
+Hunks to KEEP for PR2 in src/preload/index.js:
+  * Remove the `import Store from "electron-store"` and the authStore
+    instance.
+  * Add the new tokenPromise / authedSync / refreshTokens / getTokens
+    block + the ipcRenderer.on("auth:changed") listener and the priming
+    invoke("auth:isAuthed") call.
+  * Replace validateSessionToken to use `await getTokens()` instead of
+    authSession.token / authSession.session.
+  * Replace tokenManager so it only exposes isValidToken + isAuthed
+    (no getToken, no clearTokens).
+  * Replace withAuth so it awaits getTokens().
+  * In initializePreload, fetch tokens via `await getTokens()` for
+    saveSilencedUsers.
+  * Replace the `auth: {...}` contextBridge surface to expose
+    isValidToken / isAuthed / isAuthedSync / onChanged ONLY.
+  * Tighten utils.openExternal to validate URL + protocol.
+
+Hunks to SKIP in src/preload/index.js (those belong to PR4):
+  * Adding `getLiveStreams, searchKick` to the kickAPI import.
+  * Adding `getLiveStreams` and `search` to the `kick:` contextBridge
+    surface.
+
+Workflow:
+
+    git checkout main
+    git pull --ff-only
+    # if PR1 not merged yet, base on it instead:
+    # git checkout pr1-electron-hardening
+    git checkout -b pr2-tokens-safestorage
+
+    git checkout -p wip/all-changes -- src/main/index.js
+    git checkout -p wip/all-changes -- src/preload/index.js
+    git checkout    wip/all-changes -- \
+        src/renderer/src/providers/ChatProvider.jsx
+
+    pnpm dev
+    # Test: log out, log in, restart app -> session persists.
+    # Confirm userData/auth.bin exists and is binary (not JSON).
+
+    git add -A
+    git commit -m "auth: encrypt tokens with safeStorage, drop preload reads"
+    git push -u origin pr2-tokens-safestorage
+    gh pr create --base main \
+       --title "Encrypt auth tokens via safeStorage" \
+       --body  "See PR_SPLIT.txt PR2 for scope."
+
+------------------------------------------------------------
+3. PR3  -  CSP + chat sanitize
+------------------------------------------------------------
+
+Depends on: nothing (independent of PR1/PR2).
+
+Files touched (whole-file checkouts are fine):
+
+    utils/constants.js
+    src/renderer/src/utils/MessageParser.jsx
+    src/renderer/src/components/Cosmetics/Emote.jsx
+    src/renderer/auth.html
+    src/renderer/chatters.html
+    src/renderer/index.html
+    src/renderer/replyThread.html
+    src/renderer/search.html
+    src/renderer/settings.html
+    src/renderer/user.html
+
+IMPORTANT: the 7 HTML files in the snapshot already contain Phase-A's
+loosened CSP (frame-src player.kick.com, child-src player.kick.com,
+images.kick.com, stream.kick.com). For PR3 you want the stricter
+version WITHOUT those - so rather than checking out the snapshot, hand
+edit each html to this CSP value:
+
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://files.kick.com https://*.kick.com https://cdn.7tv.app https://cdn.kicktalk.app https://api.kicktalk.app; media-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' https://kick.com https://*.kick.com https://7tv.io https://cdn.7tv.app https://api.kicktalk.app https://cdn.kicktalk.app wss://events.7tv.io wss://ws-us2.pusher.com ws://localhost:* http://localhost:*; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'none';" />
+
+Workflow:
+
+    git checkout main
+    git pull --ff-only
+    git checkout -b pr3-csp-sanitize
+
+    git checkout wip/all-changes -- \
+        utils/constants.js \
+        src/renderer/src/utils/MessageParser.jsx \
+        src/renderer/src/components/Cosmetics/Emote.jsx
+
+    # Manually replace the CSP meta in each of the 7 html files with the
+    # stricter version above. Easiest:
+    for f in src/renderer/*.html; do
+      sed -i.bak 's|<meta http-equiv="Content-Security-Policy"[^/]*/>|<meta http-equiv="Content-Security-Policy" content="...the stricter CSP from PR_SPLIT.txt..." />|' "$f"
+    done
+    rm src/renderer/*.html.bak
+    # Or just open each in your editor and paste the meta value.
+
+    pnpm dev
+    # Test: scroll chat, click a user link, view emotes - no CSP
+    # violations in DevTools console.
+
+    git add -A
+    git commit -m "csp: strict default-src; sanitize chat URLs and emote ids"
+    git push -u origin pr3-csp-sanitize
+    gh pr create --base main \
+       --title "Strict CSP + chat URL/emote sanitization" \
+       --body  "See PR_SPLIT.txt PR3 for scope."
+
+------------------------------------------------------------
+4. PR4  -  Phase A: Browse / Search / Watch + iframe player
+------------------------------------------------------------
+
+Depends on: PR3 (CSP) merged - this PR amends the CSP to allow the
+            player iframe and Kick image hosts. If PR3 not merged,
+            include those CSP changes here AND drop them from PR3.
+
+Files touched:
+
+  New files (whole-file checkout):
+    src/renderer/src/components/StreamPlayer.jsx
+    src/renderer/src/pages/BrowsePage.jsx
+    src/renderer/src/pages/SearchPage.jsx
+    src/renderer/src/pages/WatchPage.jsx
+    src/renderer/src/assets/styles/pages/BrowsePage.scss
+    src/renderer/src/assets/styles/pages/WatchPage.scss
+
+  Modified (whole-file checkout from snapshot):
+    src/renderer/src/main.jsx
+    src/renderer/src/App.jsx
+    src/renderer/src/components/TitleBar.jsx
+    src/renderer/src/assets/styles/components/TitleBar.scss
+    utils/services/kick/kickAPI.js
+
+  Modified (HUNK SELECT - take only the new kick.* exposure):
+    src/preload/index.js
+      Keep:
+        - the `getLiveStreams, searchKick` import addition
+        - the `getLiveStreams` + `search` entries on the kick: object
+      Skip everything that already belongs to PR2.
+
+  Modified (CSP - amend the strict one from PR3):
+    src/renderer/auth.html
+    src/renderer/chatters.html
+    src/renderer/index.html
+    src/renderer/replyThread.html
+    src/renderer/search.html
+    src/renderer/settings.html
+    src/renderer/user.html
+      Add to img-src:   https://images.kick.com https://stream.kick.com
+      Add directives:   frame-src https://player.kick.com;
+                        child-src https://player.kick.com;
+      (Place the two new directives just before object-src 'none';)
+
+Workflow:
+
+    git checkout main
+    git pull --ff-only
+    # If PR3 not merged yet, branch off pr3-csp-sanitize instead.
+    git checkout -b pr4-stream-pages
+
+    # whole-file checkouts
+    git checkout wip/all-changes -- \
+        src/renderer/src/components/StreamPlayer.jsx \
+        src/renderer/src/pages/BrowsePage.jsx \
+        src/renderer/src/pages/SearchPage.jsx \
+        src/renderer/src/pages/WatchPage.jsx \
+        src/renderer/src/assets/styles/pages/BrowsePage.scss \
+        src/renderer/src/assets/styles/pages/WatchPage.scss \
+        src/renderer/src/main.jsx \
+        src/renderer/src/App.jsx \
+        src/renderer/src/components/TitleBar.jsx \
+        src/renderer/src/assets/styles/components/TitleBar.scss \
+        utils/services/kick/kickAPI.js
+
+    # hunk select for preload
+    git checkout -p wip/all-changes -- src/preload/index.js
+
+    # CSP amend on each html (manual edit, see directives above)
+
+    pnpm dev
+    # Test:
+    #   - Click "Browse" -> grid loads (or empty state if endpoint
+    #     shape differs - in DevTools Network tab inspect the actual
+    #     response from kick.com/stream/livestreams/en and adjust
+    #     getLiveStreams in utils/services/kick/kickAPI.js).
+    #   - Click a stream card -> /watch/<slug> loads, iframe shows
+    #     player, chat fills right rail.
+    #   - "Search" -> type a known channel (e.g. "xqc") -> result
+    #     row appears, click navigates to watch page.
+
+    git add -A
+    git commit -m "browse, search, watch pages with iframe player"
+    git push -u origin pr4-stream-pages
+    gh pr create --base main \
+       --title "Phase A: Browse / Search / Watch pages" \
+       --body  "See PR_SPLIT.txt PR4 for scope."
+
+------------------------------------------------------------
+5. Cleanup
+------------------------------------------------------------
+
+After all four PRs are merged:
+
+    git checkout main
+    git pull --ff-only
+    git branch -D wip/all-changes \
+                  pr1-electron-hardening \
+                  pr2-tokens-safestorage \
+                  pr3-csp-sanitize \
+                  pr4-stream-pages
+    git push origin --delete wip/all-changes  # if you pushed it
+    rm PR_SPLIT.txt
+
+------------------------------------------------------------
+Tips
+------------------------------------------------------------
+
+* `git checkout -p <ref> -- <file>` is the workhorse for splitting
+  hunks. Answers: y=keep, n=skip, s=split smaller, e=edit hunk by hand,
+  q=quit, ?=help.
+
+* When `e` is needed (a single hunk straddles two PRs), the editor
+  opens with the diff. Lines starting with `+` will be added, lines
+  starting with `-` will be removed, lines starting with ` ` are
+  context. Delete the `+` / `-` lines that DON'T belong in this PR
+  (replace with a space prefix to keep them out of the patch).
+
+* If you make a mistake, `git restore --staged --worktree <file>` will
+  revert the file to its committed state on the current branch.
+
+* Test each PR in isolation before opening the next. Each PR should
+  build and run on its own.
+
+* Each PR's commit message subject should be ~50 chars; body lines
+  should wrap at ~72.
+
+* If `gh pr create` is not installed, push the branch and open the PR
+  through the GitHub web UI instead.
