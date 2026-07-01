@@ -11,7 +11,11 @@ if (process.env.NODE_ENV === "development") {
 }
 
 const isDev = process.env.NODE_ENV === "development";
+<<<<<<< HEAD
 const iconPath = process.platform === "win32"
+=======
+const iconPath = process.platform === "win32" 
+>>>>>>> a3570be165618f70449257bbb70df7cd16b66efe
   ? join(__dirname, "../../resources/icons/win/KickTalk_v1.ico")
   : join(__dirname, "../../resources/icons/KickTalk_v1.png");
 
@@ -829,10 +833,13 @@ const installSessionPolicy = () => {
 // initialization and is ready to create browser windows.
 // Some APIs can only be used after this event occurs.
 app.whenReady().then(() => {
+<<<<<<< HEAD
   installSessionPolicy();
   migrateLegacyAuthStore();
   ensureAuthCache();
 
+=======
+>>>>>>> a3570be165618f70449257bbb70df7cd16b66efe
   tray = new Tray(iconPath);
   tray.setToolTip("KickTalk");
 
